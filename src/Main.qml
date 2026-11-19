@@ -57,6 +57,10 @@ ApplicationWindow {
     property var compressionReturnFocus: null
     property bool allowClose: false
     property int lastSelected: -1
+    // Qt Multimedia probes the GPU's video decoders when first used, which takes seconds on some
+    // machines, so the player loads with the first video slide rather than with every window.
+    property bool videoUsed: false
+    readonly property var player: videoLoader.item ? videoLoader.item.player : null
     // Front matter and boundary blank lines have no position in the slide editor.
     property int sourceOnlyCursor: -1
     property int dragIndex: -1
@@ -93,7 +97,7 @@ ApplicationWindow {
             } else stage.forceActiveFocus()
         } else {
             presenterWindow.hide()
-            player.stop()
+            if (player) player.stop()
             // Clear fullscreen before restoring the editor's output and geometry.
             // Remap only after both are set, since showNormal restores Qt's own saved geometry.
             win.hide()
@@ -163,6 +167,7 @@ ApplicationWindow {
         if (!presenting) togglePresent()
     }
     function toggleVideo() {
+        if (!player) return
         if (player.playbackState === MediaPlayer.PlayingState) player.pause()
         else {
             if (player.mediaStatus === MediaPlayer.EndOfMedia) player.position = 0
@@ -180,6 +185,22 @@ ApplicationWindow {
         if (slideEditor.activeFocus || sourceEditor.activeFocus) thumbnails.forceActiveFocus()
         else if (markdown) restoreSource(sourceEditor.cursorPosition)
         else slideEditor.forceActiveFocus()
+    }
+    function caretEdge(event) {
+        const edges = [
+            [StandardKey.MoveToStartOfLine, "lineStart", false],
+            [StandardKey.SelectStartOfLine, "lineStart", true],
+            [StandardKey.MoveToEndOfLine, "lineEnd", false],
+            [StandardKey.SelectEndOfLine, "lineEnd", true],
+            [StandardKey.MoveToStartOfDocument, "documentStart", false],
+            [StandardKey.SelectStartOfDocument, "documentStart", true],
+            [StandardKey.MoveToEndOfDocument, "documentEnd", false],
+            [StandardKey.SelectEndOfDocument, "documentEnd", true],
+        ]
+        for (const [key, name, extend] of edges) {
+            if (event.matches(key)) return { name: name, extend: extend }
+        }
+        return null
     }
     function editorKey(editor, flick, event) {
         if ((event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
@@ -215,19 +236,27 @@ ApplicationWindow {
         let position = editor.cursorPosition
         let scroll = flick.contentY
         let page = event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp
+        let edge = page ? null : caretEdge(event)
         if (page) {
             let amount = Math.max(40, flick.height - 40) * (event.key === Qt.Key_PageDown ? 1 : -1)
             let rect = editor.positionToRectangle(position)
             position = editor.positionAt(rect.x, Math.max(0, rect.y + rect.height / 2 + amount))
             scroll += amount
-        } else if (event.key === Qt.Key_Home) {
-            position = control || position === 0 ? 0 : editor.text.lastIndexOf("\n", position - 1) + 1
-        } else if (event.key === Qt.Key_End) {
+        } else if (!edge) {
+            return
+        } else if (edge.name === "documentStart") {
+            position = 0
+        } else if (edge.name === "documentEnd") {
+            position = editor.length
+        } else if (edge.name === "lineStart") {
+            position = position === 0 ? 0 : editor.text.lastIndexOf("\n", position - 1) + 1
+        } else {
             let end = editor.text.indexOf("\n", position)
-            position = control || end < 0 ? editor.length : end
-        } else return
+            position = end < 0 ? editor.length : end
+        }
         event.accepted = true
-        if (event.modifiers & Qt.ShiftModifier) editor.moveCursorSelection(position, TextEdit.SelectCharacters)
+        let extend = page ? event.modifiers & Qt.ShiftModifier : edge.extend
+        if (extend) editor.moveCursorSelection(position, TextEdit.SelectCharacters)
         else editor.cursorPosition = position
         if (page) flick.contentY = Math.max(0, Math.min(Math.max(0, flick.contentHeight - flick.height + flick.bottomMargin), scroll))
     }
@@ -271,6 +300,12 @@ ApplicationWindow {
         return deck.sourcePosition() + deck.slideSource.indexOf(deck.slideText)
     }
     function setMode(name) { changeMode(name, false) }
+    // A placed image's position, by the id slides write in their Markdown.
+    function positionName(id) {
+        return ({ "top-left": qsTr("Top left"), "top": qsTr("Top"), "top-right": qsTr("Top right"),
+                  "left": qsTr("Left"), "center": qsTr("Center"), "right": qsTr("Right"),
+                  "bottom-left": qsTr("Bottom left"), "bottom": qsTr("Bottom"), "bottom-right": qsTr("Bottom right") })[id] || id
+    }
     function changeMode(name, preserveEditing) {
         const switchingEditors = preserveEditing && !overview && name !== "overview"
         const editorFocused = sourceEditor.activeFocus || slideEditor.activeFocus
@@ -385,7 +420,16 @@ ApplicationWindow {
         }
         syncingEditor = false
     }
-    Component.onCompleted: { syncSourceEditor(); syncEditors(); lastSelected = deck.selected; Qt.callLater(thumbnails.revealSelection); if (deck.path !== "") focusForDeck(true) }
+    function syncVideo(changedSlide) {
+        const nextVideo = deck.media.video ? deck.media.url.toString() : ""
+        if (nextVideo) videoUsed = true
+        if (!player || (!changedSlide && player.source.toString() === nextVideo)) return
+        player.stop()
+        videoLoader.item.clearOutput()
+        player.source = nextVideo
+        if (presenting && deck.media.video && deck.media.autoplay) player.play()
+    }
+    Component.onCompleted: { syncSourceEditor(); syncEditors(); syncVideo(true); lastSelected = deck.selected; Qt.callLater(thumbnails.revealSelection); if (deck.path !== "") focusForDeck(true) }
     Connections {
         target: deck
         function onCompressingImageChanged() {
@@ -405,15 +449,8 @@ ApplicationWindow {
         function onSelectionChanged() {
             win.syncEditors()
             if (win.dragIndex < 0 && win.lastSelected !== deck.selected) Qt.callLater(thumbnails.revealSelection)
-            const nextVideo = deck.media.video ? deck.media.url.toString() : ""
-            const changedVideo = win.lastSelected !== deck.selected || player.source.toString() !== nextVideo
+            win.syncVideo(win.lastSelected !== deck.selected)
             win.lastSelected = deck.selected
-            if (changedVideo) {
-                player.stop()
-                video.clearOutput()
-                player.source = nextVideo
-                if (win.presenting && deck.media.video && deck.media.autoplay) player.play()
-            }
         }
         function onModelAboutToBeReset() {
             thumbnails.cancelFlick()
@@ -423,7 +460,7 @@ ApplicationWindow {
         function onModelReset() { Qt.callLater(thumbnails.revealSelection) }
         function onOpened(existing) { win.sourceOnlyCursor = -1; Qt.callLater(function() { win.focusForDeck(existing) }) }
     }
-    onPresentingChanged: { if (presenting && deck.media.video && deck.media.autoplay) player.play() }
+    onPresentingChanged: { if (player && presenting && deck.media.video && deck.media.autoplay) player.play() }
     onClosing: function(close) {
         if (!allowClose && !deck.flushAutosave() && deck.dirty) {
             close.accepted = false
@@ -434,13 +471,13 @@ ApplicationWindow {
         if (presenting) {
             presenting = false
             presenterWindow.hide()
-            player.stop()
+            if (player) player.stop()
         }
     }
     ApplicationWindow {
         id: presenterWindow; objectName: "presenterWindow"
         visible: false; minimumWidth: 800; minimumHeight: 520
-        title: deck.title + " — Presenter View"
+        title: qsTr("%1 — Presenter View").arg(deck.title)
         color: win.ui.background
         palette.window: win.ui.panel; palette.base: win.ui.background; palette.text: win.ui.foreground
         palette.windowText: win.ui.foreground; palette.button: win.ui.button; palette.buttonText: win.ui.foreground
@@ -461,11 +498,11 @@ ApplicationWindow {
                     Layout.fillWidth: true; elide: Text.ElideRight
                 }
                 Label {
-                    text: "Slide " + (deck.selected + 1) + " of " + deck.count
+                    text: qsTr("Slide %1 of %2").arg(deck.selected + 1).arg(deck.count)
                     color: win.ui.muted; font.pixelSize: 16
                 }
                 Button {
-                    text: "End show"
+                    text: qsTr("End show")
                     onClicked: win.togglePresent()
                     contentItem: Text { text: parent.text; color: win.ui.foreground; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     background: Rectangle { color: parent.hovered ? win.ui.hover : win.ui.button; radius: win.softRadius; border.color: win.ui.border }
@@ -475,7 +512,7 @@ ApplicationWindow {
                 Layout.fillWidth: true; Layout.preferredHeight: presenterWindow.height * 0.42; spacing: 22
                 ColumnLayout {
                     Layout.fillWidth: true; Layout.fillHeight: true; Layout.preferredWidth: 2
-                    Label { text: "CURRENT"; color: win.ui.muted; font.pixelSize: 12; font.bold: true }
+                    Label { text: qsTr("Current"); font.capitalization: Font.AllUppercase; color: win.ui.muted; font.pixelSize: 12; font.bold: true }
                     Item {
                         Layout.fillWidth: true; Layout.fillHeight: true
                         Rectangle {
@@ -494,7 +531,7 @@ ApplicationWindow {
                 }
                 ColumnLayout {
                     Layout.fillWidth: true; Layout.fillHeight: true; Layout.preferredWidth: 1
-                    Label { text: "NEXT"; color: win.ui.muted; font.pixelSize: 12; font.bold: true }
+                    Label { text: qsTr("Next"); font.capitalization: Font.AllUppercase; color: win.ui.muted; font.pixelSize: 12; font.bold: true }
                     Item {
                         Layout.fillWidth: true; Layout.fillHeight: true
                         Rectangle {
@@ -511,20 +548,20 @@ ApplicationWindow {
                             }
                             Label {
                                 anchors.centerIn: parent; visible: deck.selected + 1 >= deck.count
-                                text: "End of presentation"; color: win.ui.muted; font.pixelSize: 16
+                                text: qsTr("End of presentation"); color: win.ui.muted; font.pixelSize: 16
                             }
                         }
                     }
                 }
             }
             Rectangle { Layout.fillWidth: true; height: 1; color: win.ui.border }
-            Label { text: "SPEAKER NOTES"; color: win.ui.muted; font.pixelSize: 12; font.bold: true }
+            Label { text: qsTr("Speaker notes"); font.capitalization: Font.AllUppercase; color: win.ui.muted; font.pixelSize: 12; font.bold: true }
             ScrollView {
                 Layout.fillWidth: true; Layout.fillHeight: true; clip: true
                 background: Rectangle { color: win.ui.panel; radius: win.rounding; border.color: win.ui.border }
                 TextArea {
                     objectName: "presenterNotes"; readOnly: true; selectByMouse: true
-                    text: deck.speakerNotes || "No speaker notes for this slide."
+                    text: deck.speakerNotes || qsTr("No speaker notes for this slide.")
                     color: deck.speakerNotes ? win.ui.foreground : win.ui.muted
                     font.pixelSize: 24; wrapMode: TextEdit.Wrap
                     leftPadding: 24; rightPadding: 24; topPadding: 20; bottomPadding: 20
@@ -533,27 +570,31 @@ ApplicationWindow {
             }
             Label {
                 Layout.fillWidth: true
-                text: "←/→ change slide   ·   Space plays media   ·   Esc ends the show"
+                text: qsTr("←/→ change slide   ·   Space plays media   ·   Esc ends the show")
                 color: win.ui.muted; font.pixelSize: 13; horizontalAlignment: Text.AlignHCenter
             }
         }
     }
     Dialog {
-        id: closeDialog; title: "Unsaved changes"; modal: true; anchors.centerIn: parent
-        standardButtons: Dialog.Discard | Dialog.Cancel
-        Label { text: "Changes could not be backed up. Discard them and quit?" }
+        id: closeDialog; objectName: "closeDialog"; title: qsTr("Unsaved changes"); modal: true; anchors.centerIn: parent
+        // Its own buttons rather than Qt's standard ones, whose text Qt sets once and never retranslates.
+        footer: DialogButtonBox {
+            Button { text: qsTr("Discard"); DialogButtonBox.buttonRole: DialogButtonBox.DestructiveRole }
+            Button { text: qsTr("Cancel"); DialogButtonBox.buttonRole: DialogButtonBox.RejectRole }
+        }
+        Label { text: qsTr("Changes could not be backed up. Discard them and quit?") }
         onDiscarded: { win.allowClose = true; win.close() }
     }
     Dialog {
         id: historyDialog; objectName: "historyDialog"
         parent: Overlay.overlay; anchors.centerIn: parent
-        modal: true; focus: true; title: "Version history"
+        modal: true; focus: true; title: qsTr("Version history")
         width: Math.min(460, win.width - 48); height: Math.min(480, win.height - 80)
         standardButtons: Dialog.Cancel
         property var versions: []
         onOpened: { deck.flushAutosave(); versions = deck.recoveryVersions() }
         contentItem: ColumnLayout {
-            Label { text: "Choose a version to restore. Your current version stays in history."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+            Label { text: qsTr("Choose a version to restore. Your current version stays in history."); wrapMode: Text.WordWrap; Layout.fillWidth: true }
             ListView {
                 id: versionList
                 Layout.fillWidth: true; Layout.fillHeight: true; clip: true
@@ -565,7 +606,7 @@ ApplicationWindow {
                     text: modelData.label
                     onClicked: if (deck.restoreVersion(modelData.name)) historyDialog.close()
                 }
-                Label { parent: versionList; anchors.centerIn: parent; visible: versionList.count === 0; text: "No earlier versions yet"; color: win.ui.muted }
+                Label { parent: versionList; anchors.centerIn: parent; visible: versionList.count === 0; text: qsTr("No earlier versions yet"); color: win.ui.muted }
             }
         }
     }
@@ -587,17 +628,17 @@ ApplicationWindow {
         Overlay.modal: Rectangle { color: "#660b0d14" }
         contentItem: ColumnLayout {
             spacing: 18
-            Label { text: "Compressing image…"; color: win.ui.foreground; font.pixelSize: 20; font.bold: true }
+            Label { text: qsTr("Compressing image…"); color: win.ui.foreground; font.pixelSize: 20; font.bold: true }
             ProgressBar {
                 Layout.fillWidth: true
                 indeterminate: true
                 palette.highlight: win.ui.accent
                 palette.dark: win.ui.border
-                Accessible.name: "Compressing image"
+                Accessible.name: qsTr("Compressing image")
             }
             Button {
                 Layout.alignment: Qt.AlignRight
-                text: "Cancel"; onClicked: compressionDialog.close()
+                text: qsTr("Cancel"); onClicked: compressionDialog.close()
             }
         }
     }
@@ -634,14 +675,14 @@ ApplicationWindow {
             spacing: 18
             ColumnLayout {
                 spacing: 6
-                Label { text: pasteDialog.isVideo ? "Paste video" : "Paste image"; color: win.ui.foreground; font.pixelSize: 20; font.bold: true }
-                Label { text: "Save to " + (pasteDialog.isVideo ? "videos/" : "images/"); color: win.ui.muted; font.pixelSize: 14 }
+                Label { text: pasteDialog.isVideo ? qsTr("Paste video") : qsTr("Paste image"); color: win.ui.foreground; font.pixelSize: 20; font.bold: true }
+                Label { text: qsTr("Save to %1").arg(pasteDialog.isVideo ? "videos/" : "images/"); color: win.ui.muted; font.pixelSize: 14 }
             }
             RowLayout {
                 Layout.fillWidth: true; spacing: 10
                 TextField {
                     id: pasteName; objectName: "pasteName"
-                    Accessible.name: "Filename"
+                    Accessible.name: qsTr("Filename")
                     Layout.fillWidth: true; implicitHeight: 44
                     font.pixelSize: 16; color: win.ui.foreground
                     selectionColor: win.ui.selection; selectedTextColor: win.ui.selectionText
@@ -660,13 +701,13 @@ ApplicationWindow {
                 Layout.fillWidth: true; spacing: 10
                 Item { Layout.fillWidth: true }
                 Button {
-                    id: cancelPasteButton; text: "Cancel"; implicitHeight: 38; implicitWidth: 84
+                    id: cancelPasteButton; text: qsTr("Cancel"); implicitHeight: 38; implicitWidth: 84
                     contentItem: Text { text: parent.text; color: win.ui.foreground; font.pixelSize: 14; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     background: Rectangle { color: cancelPasteButton.hovered ? win.ui.hover : win.ui.button; radius: Math.min(4, win.rounding); border.color: cancelPasteButton.activeFocus ? win.ui.accent : "transparent" }
                     onClicked: pasteDialog.close()
                 }
                 Button {
-                    id: savePasteButton; text: "Save " + (pasteDialog.isVideo ? "video" : "image")
+                    id: savePasteButton; text: pasteDialog.isVideo ? qsTr("Save video") : qsTr("Save image")
                     implicitHeight: 38; implicitWidth: 112; enabled: pasteName.text.trim().length > 0
                     contentItem: Text { text: parent.text; color: win.ui.accentText; font.pixelSize: 14; font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     background: Rectangle { color: !savePasteButton.enabled ? win.ui.border : savePasteButton.hovered ? win.ui.accentHover : win.ui.accent; radius: Math.min(4, win.rounding); border.color: savePasteButton.activeFocus ? win.ui.foreground : "transparent" }
@@ -679,6 +720,7 @@ ApplicationWindow {
     Shortcut { enabled: !win.popupOpen && !deck.compressingImage; sequences: [StandardKey.Open]; onActivated: deck.openDialog() }
     Shortcut { enabled: !win.popupOpen && !deck.compressingImage; sequences: [StandardKey.Save]; onActivated: deck.save() }
     Shortcut { enabled: !win.popupOpen && !deck.compressingImage; sequences: [StandardKey.SaveAs]; onActivated: deck.saveAs() }
+    Shortcut { enabled: !win.popupOpen && !deck.compressingImage; sequences: [StandardKey.Quit]; context: Qt.ApplicationShortcut; onActivated: win.close() }
     Shortcut { sequence: "Ctrl+E"; enabled: !win.popupOpen && !deck.compressingImage && !win.presenting && !deck.exporting; onActivated: deck.exportDialog("pdf") }
     Shortcut { sequence: "Ctrl+Shift+E"; enabled: !win.popupOpen && !deck.compressingImage && !win.presenting && !deck.exporting; onActivated: deck.exportDialog("pptx") }
     Shortcut { sequences: ["?", "Shift+?"]; enabled: !win.popupOpen && !deck.compressingImage && !win.presenting && !slideEditor.activeFocus && !sourceEditor.activeFocus; onActivated: shortcutsOverlay.open() }
@@ -820,7 +862,7 @@ ApplicationWindow {
         width: badgeLabel.implicitWidth + 12; height: badgeLabel.implicitHeight + 6
         color: current ? (active ? win.ui.accent : win.ui.inactiveSelection) : win.ui.border
         topRightRadius: win.softRadius; bottomLeftRadius: win.rounding
-        Label { id: badgeLabel; anchors.centerIn: parent; text: "Slide " + (parent.slide + 1); font.pixelSize: 10; color: parent.current ? (parent.active ? win.ui.accentText : win.ui.inactiveSelectionText) : win.ui.foreground }
+        Label { id: badgeLabel; anchors.centerIn: parent; text: qsTr("Slide %1").arg(parent.slide + 1); font.pixelSize: 10; color: parent.current ? (parent.active ? win.ui.accentText : win.ui.inactiveSelectionText) : win.ui.foreground }
     }
     component AppMenu: Menu {
         id: appMenu
@@ -884,33 +926,32 @@ ApplicationWindow {
         }
         RowLayout {
             anchors.fill: parent; anchors.leftMargin: editorBar.textInset - 10; anchors.rightMargin: 14; spacing: 2
-            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "boldButton"; iconName: "bold"; label: "Bold"; description: "Bold (Ctrl+B)"; onClicked: win.formatSlide("bold") }
-            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "italicButton"; iconName: "italic"; label: "Italic"; description: "Italic (Ctrl+I)"; onClicked: win.formatSlide("italic") }
-            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "underlineButton"; iconName: "underline"; label: "Underline"; description: "Underline (Ctrl+U)"; onClicked: win.formatSlide("underline") }
-            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "headlineButton"; iconName: "headline"; label: "Headline"; description: "Headline (Ctrl+H)"; onClicked: win.formatSlide("headline") }
-            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "codeButton"; iconName: "code"; label: "Code"; description: "Code block (Ctrl+K)"; onClicked: win.formatSlide("code") }
-            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "commentButton"; iconName: "comment"; label: "Note"; description: "Comment, hidden on slide (Ctrl+/)"; onClicked: win.formatSlide("comment") }
+            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "boldButton"; iconName: "bold"; label: qsTr("Bold"); description: qsTr("Bold") + " (Ctrl+B)"; onClicked: win.formatSlide("bold") }
+            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "italicButton"; iconName: "italic"; label: qsTr("Italic"); description: qsTr("Italic") + " (Ctrl+I)"; onClicked: win.formatSlide("italic") }
+            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "underlineButton"; iconName: "underline"; label: qsTr("Underline"); description: qsTr("Underline") + " (Ctrl+U)"; onClicked: win.formatSlide("underline") }
+            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "headlineButton"; iconName: "headline"; label: qsTr("Headline"); description: qsTr("Headline") + " (Ctrl+H)"; onClicked: win.formatSlide("headline") }
+            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "codeButton"; iconName: "code"; label: qsTr("Code"); description: qsTr("Code block") + " (Ctrl+K)"; onClicked: win.formatSlide("code") }
+            EditorButton { compact: editorBar.compact; objectName: editorBar.scope + "commentButton"; iconName: "comment"; label: qsTr("Note"); description: qsTr("Comment, hidden on slide") + " (Ctrl+/)"; onClicked: win.formatSlide("comment") }
             Item { Layout.fillWidth: true }
-            EditorButton { compact: editorBar.compact; iconName: "media-add"; label: "Media"; description: "Add image / video"; onClicked: deck.importDialog() }
+            EditorButton { compact: editorBar.compact; iconName: "media-add"; label: qsTr("Media"); description: qsTr("Add image / video"); onClicked: deck.importDialog() }
             EditorButton {
                 compact: editorBar.compact
-                objectName: editorBar.scope + "mediaOptionsButton"; iconName: "adjust"; label: "Layout"; description: "Image / video options"; menu: true
+                objectName: editorBar.scope + "mediaOptionsButton"; iconName: "adjust"; label: qsTr("Layout"); description: qsTr("Image / video options"); menu: true
                 enabled: !!deck.media.url.toString()
                 dropdown: mediaMenu
                 AppMenu {
                     hasChecks: true
                     id: mediaMenu; objectName: editorBar.scope + "mediaMenu"; y: parent.height + 4
                     readonly property bool placed: !!deck.media.position
-                    AppMenuItem { text: "Fit"; checkable: true; checked: !deck.media.span && !mediaMenu.placed; onTriggered: deck.setMediaMode("fit") }
-                    AppMenuItem { text: "Span"; checkable: true; checked: deck.media.span; onTriggered: deck.setMediaMode("span") }
+                    AppMenuItem { text: qsTr("Fit"); checkable: true; checked: !deck.media.span && !mediaMenu.placed; onTriggered: deck.setMediaMode("fit") }
+                    AppMenuItem { text: qsTr("Span"); checkable: true; checked: deck.media.span; onTriggered: deck.setMediaMode("span") }
                     AppMenu {
                         id: placeMenu; objectName: editorBar.scope + "placeMenu"
-                        title: "Place"; hasChecks: true; enabled: !deck.media.video
+                        title: qsTr("Place"); hasChecks: true; enabled: !deck.media.video
                         Instantiator {
                             model: deck.mediaPositions
                             delegate: AppMenuItem {
-                                // "bottom-right" reads as "Bottom right".
-                                text: modelData.charAt(0).toUpperCase() + modelData.slice(1).replace("-", " ")
+                                text: win.positionName(modelData)
                                 checkable: true; checked: deck.media.position === modelData
                                 onTriggered: deck.setMediaPosition(modelData)
                             }
@@ -920,17 +961,17 @@ ApplicationWindow {
                     }
                     AppMenu {
                         objectName: editorBar.scope + "sizeMenu"
-                        title: "Size"; hasChecks: true; enabled: mediaMenu.placed
-                        AppMenuItem { text: "Small (10%)"; checkable: true; checked: deck.media.size === 10; onTriggered: deck.setMediaSize(10) }
-                        AppMenuItem { text: "Medium (20%)"; checkable: true; checked: deck.media.size === 20; onTriggered: deck.setMediaSize(20) }
-                        AppMenuItem { text: "Large (35%)"; checkable: true; checked: deck.media.size === 35; onTriggered: deck.setMediaSize(35) }
+                        title: qsTr("Size"); hasChecks: true; enabled: mediaMenu.placed
+                        AppMenuItem { text: qsTr("Small (10%)"); checkable: true; checked: deck.media.size === 10; onTriggered: deck.setMediaSize(10) }
+                        AppMenuItem { text: qsTr("Medium (20%)"); checkable: true; checked: deck.media.size === 20; onTriggered: deck.setMediaSize(20) }
+                        AppMenuItem { text: qsTr("Large (35%)"); checkable: true; checked: deck.media.size === 35; onTriggered: deck.setMediaSize(35) }
                     }
                     AppMenuSeparator {}
-                    AppMenuItem { text: "Match image edges"; enabled: !mediaMenu.placed; checkable: true; checked: deck.media.background === "auto"; onTriggered: deck.matchImageBackground(true) }
-                    AppMenuItem { text: deck.media.video ? "Blurred first frame" : "Blurred image"; enabled: !mediaMenu.placed; checkable: true; checked: deck.media.background === "blur"; onTriggered: deck.setMediaBackground("blur") }
-                    AppMenuItem { objectName: editorBar.scope + "whiteBackgroundItem"; text: "White"; enabled: !mediaMenu.placed; checkable: true; checked: deck.media.background === "white"; onTriggered: deck.setMediaBackground("white") }
-                    AppMenuItem { text: "Black"; enabled: !mediaMenu.placed; checkable: true; checked: deck.media.background === "black"; onTriggered: deck.setMediaBackground("black") }
-                    AppMenuItem { text: "Use theme color"; enabled: !mediaMenu.placed; checkable: true; checked: deck.media.background === "theme"; onTriggered: deck.matchImageBackground(false) }
+                    AppMenuItem { text: qsTr("Match image edges"); enabled: !mediaMenu.placed; checkable: true; checked: deck.media.background === "auto"; onTriggered: deck.matchImageBackground(true) }
+                    AppMenuItem { text: deck.media.video ? qsTr("Blurred first frame") : qsTr("Blurred image"); enabled: !mediaMenu.placed; checkable: true; checked: deck.media.background === "blur"; onTriggered: deck.setMediaBackground("blur") }
+                    AppMenuItem { objectName: editorBar.scope + "whiteBackgroundItem"; text: qsTr("White"); enabled: !mediaMenu.placed; checkable: true; checked: deck.media.background === "white"; onTriggered: deck.setMediaBackground("white") }
+                    AppMenuItem { text: qsTr("Black"); enabled: !mediaMenu.placed; checkable: true; checked: deck.media.background === "black"; onTriggered: deck.setMediaBackground("black") }
+                    AppMenuItem { text: qsTr("Use theme color"); enabled: !mediaMenu.placed; checkable: true; checked: deck.media.background === "theme"; onTriggered: deck.matchImageBackground(false) }
                 }
             }
         }
@@ -947,8 +988,8 @@ ApplicationWindow {
             anchors.left: parent.left; anchors.leftMargin: win.inset; anchors.verticalCenter: parent.verticalCenter
             text: "Hype"; font.pixelSize: 22; font.bold: true
             color: logoHover.hovered ? win.ui.accentHover : win.ui.accent
-            Accessible.role: Accessible.Button; Accessible.name: "Keyboard shortcuts"
-            ToolTip.visible: logoHover.hovered; ToolTip.delay: 400; ToolTip.text: "Keyboard shortcuts (?)"
+            Accessible.role: Accessible.Button; Accessible.name: qsTr("Keyboard shortcuts")
+            ToolTip.visible: logoHover.hovered; ToolTip.delay: 400; ToolTip.text: qsTr("Keyboard shortcuts") + " (?)"
             HoverHandler { id: logoHover; cursorShape: Qt.PointingHandCursor }
             TapHandler { onTapped: shortcutsOverlay.open() }
         }
@@ -969,14 +1010,14 @@ ApplicationWindow {
                 width: Math.min(implicitWidth, summary.room); elide: Text.ElideRight
                 text: deck.exporting ? deck.exportStatus
                     : win.flash ? win.flash
-                    : deck.selectionCount > 1 ? deck.selectionCount + " slides selected" : "Slide " + (deck.selected+1) + " of " + deck.count
+                    : deck.selectionCount > 1 ? qsTr("%Ln slides selected", "", deck.selectionCount) : qsTr("Slide %1 of %2").arg(deck.selected + 1).arg(deck.count)
                 font.pixelSize: 12; color: win.flash && win.flashFailed && !deck.exporting ? win.ui.error : win.ui.muted
                 ToolTip.visible: statusHover.hovered && truncated; ToolTip.text: text
                 HoverHandler { id: statusHover }
             }
         }
         Rectangle {
-            visible: deck.exporting; Accessible.name: "Export progress"
+            visible: deck.exporting; Accessible.name: qsTr("Export progress")
             x: win.inset; anchors.bottom: parent.bottom
             width: (parent.width - 2 * win.inset) * deck.exportProgress; height: 2; color: win.ui.accent
         }
@@ -987,7 +1028,7 @@ ApplicationWindow {
             ToolButton {
                 id: cancelExport
                 visible: deck.exporting; Layout.preferredHeight: 36; leftPadding: 10; rightPadding: 10
-                contentItem: Label { text: "Cancel export"; font.pixelSize: 12; color: cancelExport.hovered ? win.ui.foreground : win.ui.muted; verticalAlignment: Text.AlignVCenter }
+                contentItem: Label { text: qsTr("Cancel export"); font.pixelSize: 12; color: cancelExport.hovered ? win.ui.foreground : win.ui.muted; verticalAlignment: Text.AlignVCenter }
                 background: Rectangle { color: cancelExport.hovered || cancelExport.down ? win.ui.hover : "transparent"; radius: win.softRadius }
                 onClicked: deck.cancelExport()
             }
@@ -998,8 +1039,8 @@ ApplicationWindow {
                 contentItem: Item {
                     AppIcon { anchors.centerIn: parent; width: 18; height: 18; name: "theme"; color: themes.hovered || themes.popup.visible ? win.ui.foreground : win.ui.muted }
                 }
-                Accessible.name: "Theme: " + currentText
-                ToolTip.visible: hovered; ToolTip.text: "Theme: " + currentText
+                Accessible.name: qsTr("Theme: %1").arg(currentText)
+                ToolTip.visible: hovered; ToolTip.text: qsTr("Theme: %1").arg(currentText)
                 delegate: ItemDelegate {
                     required property string modelData
                     required property int index
@@ -1033,7 +1074,7 @@ ApplicationWindow {
                     return showNotoVariants || !name.startsWith("Noto ") ||
                         ["Noto Sans", "Noto Serif", "Noto Sans Mono", deck.fontName].indexOf(name) >= 0
                 })
-                model: visibleFonts.concat([showNotoVariants ? "Fewer Noto fonts" : "More Noto fonts…"])
+                model: visibleFonts.concat([showNotoVariants ? qsTr("Fewer Noto fonts") : qsTr("More Noto fonts…")])
                 currentIndex: visibleFonts.indexOf(deck.fontName)
                 displayText: deck.fontName
                 onActivated: function(index) {
@@ -1048,7 +1089,7 @@ ApplicationWindow {
                 contentItem: Item {
                     AppIcon { anchors.centerIn: parent; width: 18; height: 18; name: "font"; color: fonts.hovered || fonts.popup.visible ? win.ui.foreground : win.ui.muted }
                 }
-                Accessible.name: "Font: " + deck.fontName
+                Accessible.name: qsTr("Font: %1").arg(deck.fontName)
                 delegate: ItemDelegate {
                     required property string modelData
                     required property int index
@@ -1070,43 +1111,43 @@ ApplicationWindow {
                     }
                     onOpened: contentItem.positionViewAtIndex(fonts.currentIndex, ListView.Contain)
                 }
-                ToolTip.visible: hovered; ToolTip.text: "Font: " + deck.fontName
+                ToolTip.visible: hovered; ToolTip.text: qsTr("Font: %1").arg(deck.fontName)
             }
             // Two switches, like their shortcuts: the overview on or off, and slides or source.
             ToolbarIconButton {
                 objectName: "overviewButton"; iconName: "overview"
                 ink: win.overview ? win.ui.accent : win.ui.muted
-                description: (win.overview ? "Leave the overview" : "Overview") + " (Ctrl+M)"
+                description: (win.overview ? qsTr("Leave the overview") : qsTr("Overview")) + " (Ctrl+M)"
                 onClicked: win.toggleOverview()
             }
             ToolbarIconButton {
                 objectName: "modeButton"
                 focusPolicy: Qt.NoFocus
                 iconName: win.editingMode
-                description: (win.editingMode === "markdown" ? "Markdown · Switch to Visual" : "Visual · Switch to Markdown") + " (Ctrl+.)"
+                description: (win.editingMode === "markdown" ? qsTr("Markdown · Switch to Visual") : qsTr("Visual · Switch to Markdown")) + " (Ctrl+.)"
                 onClicked: win.overview ? win.setMode(win.editingMode === "markdown" ? "visual" : "markdown") : win.toggleSource()
             }
             ToolbarIconButton {
                 objectName: "fileButton"; iconName: "file"; ink: deck.dirty ? win.ui.accent : win.ui.muted
-                description: deck.dirty ? "File · Unsaved changes" : "File"
+                description: deck.dirty ? qsTr("File · Unsaved changes") : qsTr("File")
                 dropdown: fileMenu
                 AppMenu {
                     id: fileMenu; objectName: "fileMenu"
                     y: parent.height + 4
-                    AppMenuItem { text: "New presentation"; hint: "Ctrl+N"; onTriggered: deck.newDeck() }
-                    AppMenuItem { text: "Open…"; hint: "Ctrl+O"; onTriggered: deck.openDialog() }
+                    AppMenuItem { text: qsTr("New presentation"); hint: "Ctrl+N"; onTriggered: deck.newDeck() }
+                    AppMenuItem { text: qsTr("Open…"); hint: "Ctrl+O"; onTriggered: deck.openDialog() }
                     AppMenuSeparator {}
-                    AppMenuItem { text: deck.dirty ? "Save changes" : "Save"; hint: "Ctrl+S"; onTriggered: deck.save() }
-                    AppMenuItem { text: "Save as…"; hint: "Ctrl+Shift+S"; onTriggered: deck.saveAs() }
+                    AppMenuItem { text: deck.dirty ? qsTr("Save changes") : qsTr("Save"); hint: "Ctrl+S"; onTriggered: deck.save() }
+                    AppMenuItem { text: qsTr("Save as…"); hint: "Ctrl+Shift+S"; onTriggered: deck.saveAs() }
                     AppMenuSeparator {}
-                    AppMenuItem { text: "Export as PDF…"; hint: "Ctrl+E"; enabled: !deck.exporting; onTriggered: deck.exportDialog("pdf") }
-                    AppMenuItem { text: "Export as PowerPoint…"; hint: "Ctrl+Shift+E"; enabled: !deck.exporting; onTriggered: deck.exportDialog("pptx") }
+                    AppMenuItem { text: qsTr("Export as PDF…"); hint: "Ctrl+E"; enabled: !deck.exporting; onTriggered: deck.exportDialog("pdf") }
+                    AppMenuItem { text: qsTr("Export as PowerPoint…"); hint: "Ctrl+Shift+E"; enabled: !deck.exporting; onTriggered: deck.exportDialog("pptx") }
                     AppMenuSeparator {}
-                    AppMenuItem { text: "Version history…"; onTriggered: historyDialog.open() }
+                    AppMenuItem { text: qsTr("Version history…"); onTriggered: historyDialog.open() }
                 }
             }
             ToolbarIconButton {
-                objectName: "presentButton"; iconName: "present"; description: "Present (Ctrl+Space)"; primary: true
+                objectName: "presentButton"; iconName: "present"; description: qsTr("Present") + " (Ctrl+Space)"; primary: true
                 onClicked: win.togglePresent()
             }
         }
@@ -1119,25 +1160,25 @@ ApplicationWindow {
         Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.35) }
         background: Rectangle { color: Qt.alpha(win.ui.panel, 0.92); border.color: win.ui.windowBorder; border.width: 2; radius: win.rounding }
         readonly property var groups: [
-            { title: "Presentation", keys: [
-                ["Ctrl+N", "New presentation"], ["Ctrl+O", "Open"], ["Ctrl+S", "Save"], ["Ctrl+Shift+S", "Save as"],
-                ["Ctrl+E", "Export as PDF"], ["Ctrl+Shift+E", "Export as PowerPoint"], ["Ctrl+Space / F5", "Present"], ["Shift+F5", "Present from first slide"], ["Esc", "Stop presenting"],
-                ["Space", "Play or pause video while presenting"] ] },
-            { title: "View", keys: [
-                ["Ctrl+M", "Overview on or off"], ["Ctrl+.", "Markdown source on or off"],
-                ["Tab", "Switch between slides and editor"], ["Enter", "Open slide from Overview"],
-                ["? / F1", "Show these shortcuts"] ] },
-            { title: "Slides", keys: [
-                ["Arrows", "Previous or next slide, by row in Overview"], ["Page Up / Page Down", "Jump five slides, or five rows in Overview"],
-                ["Home / End", "First or last slide when focused in Slides list"], ["Shift+Arrows", "Extend the selection"],
-                ["Ctrl+Arrows", "Move selected slides"], ["Ctrl+Page Up / Page Down", "Move selected slides five places"],
-                ["Ctrl+Home / End", "Move selected slides to first or last"], ["Ctrl+Enter", "Add a slide"],
-                ["Ctrl+D", "Duplicate"], ["Delete", "Delete"] ] },
-            { title: "Editing", keys: [
-                ["Ctrl+B", "Bold"], ["Ctrl+I", "Italic"], ["Ctrl+U", "Underline"], ["Ctrl+H", "Headline"], ["Ctrl+K", "Code block"],
-                ["Ctrl+Up / Down", "Previous or next slide"], ["Ctrl+Page Up / Page Down", "Jump five slides"],
-                ["Ctrl+/", "Comment, hidden on slide"],
-                ["Home / End", "Start or end of the line"], ["Ctrl+Z", "Undo"], ["Ctrl+Shift+Z", "Redo"], ["Ctrl+V", "Paste text, or add and name media"] ] }
+            { title: qsTr("Presentation"), keys: [
+                ["Ctrl+N", qsTr("New presentation")], ["Ctrl+O", qsTr("Open")], ["Ctrl+S", qsTr("Save")], ["Ctrl+Shift+S", qsTr("Save as")], ["Ctrl+Q", qsTr("Quit")],
+                ["Ctrl+E", qsTr("Export as PDF")], ["Ctrl+Shift+E", qsTr("Export as PowerPoint")], ["Ctrl+Space / F5", qsTr("Present")], ["Shift+F5", qsTr("Present from first slide")], ["Esc", qsTr("Stop presenting")],
+                ["Space", qsTr("Play or pause video while presenting")] ] },
+            { title: qsTr("View"), keys: [
+                ["Ctrl+M", qsTr("Overview on or off")], ["Ctrl+.", qsTr("Markdown source on or off")],
+                ["Tab", qsTr("Switch between slides and editor")], ["Enter", qsTr("Open slide from Overview")],
+                ["? / F1", qsTr("Show these shortcuts")] ] },
+            { title: qsTr("Slides"), keys: [
+                ["Arrows", qsTr("Previous or next slide, by row in Overview")], ["Page Up / Page Down", qsTr("Jump five slides, or five rows in Overview")],
+                ["Home / End", qsTr("First or last slide when focused in Slides list")], ["Shift+Arrows", qsTr("Extend the selection")],
+                ["Ctrl+Arrows", qsTr("Move selected slides")], ["Ctrl+Page Up / Page Down", qsTr("Move selected slides five places")],
+                ["Ctrl+Home / End", qsTr("Move selected slides to first or last")], ["Ctrl+Enter", qsTr("Add a slide")],
+                ["Ctrl+D", qsTr("Duplicate")], ["Delete", qsTr("Delete")] ] },
+            { title: qsTr("Editing"), keys: [
+                ["Ctrl+B", qsTr("Bold")], ["Ctrl+I", qsTr("Italic")], ["Ctrl+U", qsTr("Underline")], ["Ctrl+H", qsTr("Headline")], ["Ctrl+K", qsTr("Code block")],
+                ["Ctrl+Up / Down", qsTr("Previous or next slide")], ["Ctrl+Page Up / Page Down", qsTr("Jump five slides")],
+                ["Ctrl+/", qsTr("Comment, hidden on slide")],
+                ["Home / End", qsTr("Start or end of the line")], ["Ctrl+Z", qsTr("Undo")], ["Ctrl+Shift+Z", qsTr("Redo")], ["Ctrl+V", qsTr("Paste text, or add and name media")] ] }
         ]
         contentItem: ColumnLayout {
             spacing: 22; focus: true
@@ -1145,7 +1186,7 @@ ApplicationWindow {
             Keys.onPressed: function(event) {
                 if (event.text === "?" || event.key === Qt.Key_F1) { shortcutsOverlay.close(); event.accepted = true }
             }
-            Label { text: "Keyboard shortcuts"; font.pixelSize: 16; font.bold: true; color: win.ui.foreground }
+            Label { text: qsTr("Keyboard shortcuts"); font.pixelSize: 16; font.bold: true; color: win.ui.foreground }
             GridLayout {
                 columns: win.width < 820 ? 1 : 2; columnSpacing: 48; rowSpacing: 22
                 Repeater {
@@ -1170,10 +1211,10 @@ ApplicationWindow {
     }
     // Shared by the sidebar and the overview, so it cannot live inside either.
     AppMenu { id: slideMenu
-        AppMenuItem { text: "New slide after this"; hint: "Ctrl+Enter"; onTriggered: { win.addSlide() } }
-        AppMenuItem { text: deck.selectionCount > 1 ? "Duplicate slides" : "Duplicate slide"; hint: "Ctrl+D"; onTriggered: deck.duplicateSlide() }
+        AppMenuItem { text: qsTr("New slide after this"); hint: "Ctrl+Enter"; onTriggered: { win.addSlide() } }
+        AppMenuItem { text: deck.selectionCount > 1 ? qsTr("Duplicate slides") : qsTr("Duplicate slide"); hint: "Ctrl+D"; onTriggered: deck.duplicateSlide() }
         AppMenuSeparator {}
-        AppMenuItem { text: deck.selectionCount > 1 ? "Delete slides" : "Delete slide"; hint: "Del"; destructive: true; onTriggered: deck.deleteSlide() }
+        AppMenuItem { text: deck.selectionCount > 1 ? qsTr("Delete slides") : qsTr("Delete slide"); hint: "Del"; destructive: true; onTriggered: deck.deleteSlide() }
     }
     RowLayout {
         anchors.fill: parent; spacing: 0
@@ -1536,18 +1577,24 @@ ApplicationWindow {
                             onStatusChanged: if (status === Image.Ready) paused = !autoplay
                         }
                     }
-                    VideoOutput {
-                        id: video; objectName: "videoOutput"
-                        visible: deck.media.video && (player.playbackState !== MediaPlayer.StoppedState || player.mediaStatus === MediaPlayer.EndOfMedia)
-                        endOfStreamPolicy: VideoOutput.KeepLastFrame
+                    Loader {
+                        id: videoLoader
+                        active: win.videoUsed
                         x: deck.media.rect.x * slideFrame.width / 1920
                         y: deck.media.rect.y * slideFrame.height / 1080
                         width: deck.media.rect.width * slideFrame.width / 1920
                         height: deck.media.rect.height * slideFrame.height / 1080
-                        fillMode: deck.media.span ? VideoOutput.PreserveAspectCrop : VideoOutput.PreserveAspectFit
+                        sourceComponent: VideoOutput {
+                            id: video; objectName: "videoOutput"
+                            property alias player: player
+                            visible: deck.media.video && (player.playbackState !== MediaPlayer.StoppedState || player.mediaStatus === MediaPlayer.EndOfMedia)
+                            endOfStreamPolicy: VideoOutput.KeepLastFrame
+                            fillMode: deck.media.span ? VideoOutput.PreserveAspectCrop : VideoOutput.PreserveAspectFit
+                            MediaPlayer { id: player; objectName: "player"; videoOutput: video; audioOutput: AudioOutput { muted: deck.media.muted } loops: deck.media.loop ? MediaPlayer.Infinite : 1; onErrorOccurred: function(error,message) { deck.setStatus(message) } }
+                        }
                     }
-                    Image { anchors.fill: parent; source: visible ? "image://slides/" + (deck.revision, deck.renderId(deck.selected)) + "/overlay" : ""; asynchronous: true; retainWhileLoading: true; sourceSize: Qt.size(1920,1080); visible: animation.active || (video.visible && deck.media.span) }
-                    Button { visible: deck.media.video && !win.presenting; anchors.centerIn: parent; text: player.playbackState === MediaPlayer.PlayingState ? "Pause" : "▶ Play"; onClicked: win.toggleVideo() }
+                    Image { anchors.fill: parent; source: visible ? "image://slides/" + (deck.revision, deck.renderId(deck.selected)) + "/overlay" : ""; asynchronous: true; retainWhileLoading: true; sourceSize: Qt.size(1920,1080); visible: animation.active || (videoLoader.item && videoLoader.item.visible && deck.media.span) }
+                    Button { visible: deck.media.video && !win.presenting; anchors.centerIn: parent; text: player && player.playbackState === MediaPlayer.PlayingState ? qsTr("Pause") : "▶ " + qsTr("Play"); onClicked: win.toggleVideo() }
                     MouseArea {
                         anchors.fill: parent
                         enabled: win.presenting
@@ -1579,7 +1626,7 @@ ApplicationWindow {
                         TextArea {
                             id: slideEditor; objectName: "slideEditor"; persistentSelection: true; textFormat: TextEdit.PlainText; color: win.ui.foreground; selectionColor: win.ui.selection; selectedTextColor: win.ui.selectionText; font.family: "JetBrains Mono"; font.pixelSize: 16
                             onActiveFocusChanged: if (activeFocus) win.focusedEditor = "slide"
-                            wrapMode: TextEdit.Wrap; leftPadding: 24; topPadding: 16; placeholderText: "# Your headline"
+                            wrapMode: TextEdit.Wrap; leftPadding: 24; topPadding: 16; placeholderText: "# " + qsTr("Your headline")
                             onTextChanged: {
                                 if (!win.syncingEditor && activeFocus) {
                                     const previousCount = deck.count
@@ -1636,5 +1683,4 @@ ApplicationWindow {
             }
         }
     }
-    MediaPlayer { id: player; objectName: "player"; videoOutput: video; audioOutput: AudioOutput { muted: deck.media.muted } loops: deck.media.loop ? MediaPlayer.Infinite : 1; onErrorOccurred: function(error,message) { deck.setStatus(message) } }
 }

@@ -48,7 +48,7 @@ class Deck : public QAbstractListModel {
     Q_PROPERTY(bool exportFailed READ exportFailed NOTIFY exportChanged)
     Q_PROPERTY(QStringList fontNames READ fontNames CONSTANT)
     Q_PROPERTY(QString fontName READ fontName NOTIFY fontChanged)
-    Q_PROPERTY(QStringList themeNames READ themeNames CONSTANT)
+    Q_PROPERTY(QStringList themeNames READ themeNames NOTIFY themesChanged)
     Q_PROPERTY(QStringList mediaPositions READ mediaPositions CONSTANT)
     Q_PROPERTY(QString themeName READ themeName NOTIFY changed)
     Q_PROPERTY(QColor background READ background NOTIFY changed)
@@ -113,6 +113,8 @@ class Deck : public QAbstractListModel {
     // For PowerPoint, animations become videos and opaque slides are stored as JPEG.
     bool renderImages(const QString &directory, int width = 1920, bool powerPoint = false);
     Q_INVOKABLE void select(int index);
+    // After a language switch, so what the window shows is made again in the new language.
+    void retranslate();
     Q_INVOKABLE void extendSelection(int index);
     Q_INVOKABLE void moveSelection(int direction);
     Q_INVOKABLE void dropSelection(int slot);
@@ -146,6 +148,7 @@ class Deck : public QAbstractListModel {
     Q_INVOKABLE void setMediaSize(double percent);
     Q_INVOKABLE void setStatus(const QString &status);
   signals:
+    void themesChanged();
     void changed(); // Document content, path, saved state, or media files; always followed by selectionChanged.
     void selectionChanged(); // Selection range or the selected slide's content/media.
     void fontChanged();
@@ -179,6 +182,8 @@ class Deck : public QAbstractListModel {
     mutable QVariantMap m_paletteCache;
     QString m_source, m_saved, m_path, m_status;
     ParsedDeck m_parsed;
+    // Whether m_parsed.error came from checking known slide boundaries rather than parsing the whole document.
+    bool m_slideChecked = false;
     int m_selected = 0, m_anchor = 0, m_revision = 0;
     QVector<State> m_undo, m_redo;
     QMap<QString, QString> m_themes;
